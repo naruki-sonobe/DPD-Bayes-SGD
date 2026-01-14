@@ -2,35 +2,29 @@
 ##      Load Required Libraries
 ###################################
 
-library(cmdstanr)   # For CmdStan-based MCMC
 library(doParallel) # For parallel computation in 'foreach'
 library(dqrng)      # For random number generation
 library(ggplot2)    # For plotting
-library(mcmcse)     # For ESS calculation
-library(posterior)  # For R-hat calculation
 library(tidyr)      # For data manipulation
 library(dplyr)      # For data summarization
+library(mcmcse)     # For calculating Effective Sample Size (ESS)
+library(tictoc)     # For timing the script
 
 # Clear the workspace
 rm(list = ls())
 
-# If cmdstan is not installed, run the following line once
-# check_cmdstan_toolchain(fix = TRUE, quiet = TRUE)
-# install_cmdstan()
-
 ###################################
-##         Helper Functions
+##          Helper Functions
 ###################################
 
+# --- Functions for Data Generation and DPD LLB ---
 generate_data <- function(n = 100, contamination_rate = 0.01) {
   n_main <- ceiling(n * (1 - contamination_rate))
   n_outliers <- n - n_main
   x_main <- dqrnorm(n = n_main, mean = 0, sd = 1)
   x_outliers <- dqrnorm(n = n_outliers, mean = 10, sd = 0.1)
   return(list(
-    n_main = n_main, n_outliers = n_outliers, x_main = x_main,
-    x_outliers = x_outliers, x_all = c(x_main, x_outliers),
-    contamination_rate = contamination_rate
+    x_all = c(x_main, x_outliers)
   ))
 }
 calc_density <- function(theta, x) {
@@ -40,31 +34,34 @@ calc_score <- function(theta, x) {
   mu <- theta[1]; sigma <- theta[2]
   cbind((x - mu) / (sigma^2), ((x - mu)^2) / (sigma^3) - 1 / sigma)
 }
-calc_regularizer <- function(theta, alpha) {
-  sigma <- theta[2]
-  c(0, -(2 * pi)^(-alpha / 2) * alpha * (1 + alpha)^(-3 / 2) * sigma^(-(alpha + 1)))
-}
 generate_y <- function(theta, m = 10) {
   dqrnorm(n = m, mean = theta[1], sd = theta[2])
 }
-dpd_function <- function(para, x_data, alpha) {
-  mu <- para[1]; sigma <- para[2]
-  if (sigma <= 0) return(Inf) 
-  ww <- dnorm(x_data, mu, sigma)^alpha
-  val <- -ww / alpha + (2 * pi * sigma^2)^(-alpha / 2) * (1 + alpha)^(-3 / 2)
-  return(val)
-}
-log_prior <- function(theta) {
+
+# --- Functions for Standard Bayes MH Algorithm ---
+
+# Log-prior for Standard Bayes: p(mu, sigma) ∝ 1/sigma
+log_prior_standard <- function(theta) {
   sigma <- theta[2]
-  if (sigma <= 0) return(-Inf) 
+  if (sigma <= 0) {
+    return(-Inf) # Return -Inf if sigma is non-positive
+  }
   return(-log(sigma))
 }
-log_likelihood <- function(theta, x, alpha) {
-  sum(dpd_function(theta, x, alpha))
+
+# Log-likelihood for Standard Bayes: Normal distribution
+log_likelihood_standard <- function(theta, x) {
+  mu <- theta[1]
+  sigma <- theta[2]
+  if (sigma <= 0) {
+    return(-Inf)
+  }
+  sum(dnorm(x, mean = mu, sd = sigma, log = TRUE))
 }
-log_posterior <- function(theta, x, w, alpha) {
-  if(theta[2] <= 0) return(-Inf)
-  log_prior(theta) - w * log_likelihood(theta, x, alpha)
+
+# Log-posterior for Standard Bayes
+log_posterior_standard <- function(theta, x) {
+  log_prior_standard(theta) + log_likelihood_standard(theta, x)
 }
 
 
@@ -75,34 +72,29 @@ n <- 1000
 contamination_rate <- 0.05
 alpha <- 0.5
 max_iter <- 500
-step_size_init <- 0.1
+step_size_init <- 1
 step_decay_rate <- 0.7
 step_decay_interval <- 25
-m <- 10
-num_sim_llb <- 10000 
-thin <- 20
-num_total_mh <- thin * num_sim_llb
+m <- 100
+num_sim <- 1000 # Posterior samples
 
 # Number of repetitions for the entire simulation
-N_repetitions <- 20
+N_repetitions <- 20 
+
 
 ##################################################
-##  Compile Stan Model from External File
+##            Main Simulation Loop
 ##################################################
-stan_model_file <- "~/Documents/Research(Master)/General_Bayes_DPD/Research paper/Simulation/Simulation1/DPD_GB_Normal.stan"
-stan_model <- cmdstan_model(stan_model_file)
+tictoc::tic()
 
-##################################################
-##  Main Simulation Loop
-##################################################
 cores <- getOption("mc.cores", detectCores())
 cl <- makeCluster(cores)
 registerDoParallel(cl)
 
-all_results <- foreach(
+# The foreach loop now returns a list of lists, so .combine is removed
+loop_results <- foreach(
   rep = 1:N_repetitions,
-  .combine = rbind,
-  .packages = c("doParallel", "dqrng", "cmdstanr", "posterior", "stats") 
+  .packages = c("doParallel", "dqrng", "stats", "mcmcse") # Added mcmcse
 ) %dopar% {
   
   # --- 1. Generate Data for this repetition ---
@@ -110,8 +102,8 @@ all_results <- foreach(
   D <- data_list$x_all
   theta_init <- c(median(D), mad(D))
   
-  # --- 2-a. LLB (Stochastic Optimization) ---
-  theta_estimates_llb <- foreach(s = 1:num_sim_llb, .combine = rbind) %do% {
+  # --- 2-a. DPD LLB Posterior (Stochastic Optimization) ---
+  theta_estimates_llb <- foreach(s = 1:num_sim, .combine = rbind) %do% {
     theta_current <- c(theta_init[1], log(theta_init[2]))
     step_size <- step_size_init
     u <- dqrexp(length(D), 1)
@@ -129,63 +121,77 @@ all_results <- foreach(
     c(theta_current[1], exp(theta_current[2]))
   }
   
-  # --- 2-b. Metropolis-Hastings (MH) ---
-  theta_dpd <- theta_init
-  eta <- step_size_init
-  for (iter_count in 1:max_iter) {
-    grad <- -colMeans(calc_density(theta_dpd, D)^alpha * calc_score(theta_dpd, D)) + calc_regularizer(theta_dpd, alpha)
-    if (iter_count %% step_decay_interval == 0) eta <- eta * step_decay_rate
-    theta_dpd <- theta_dpd - eta * grad
-  }
-  ep <- 0.01; est <- theta_dpd; R <- 2
-  dDPD <- sapply(1:R, function(r) { ee <- rep(0, R); ee[r] <- ep; (dpd_function(est + ee, D, alpha) - dpd_function(est - ee, D, alpha)) / (2 * ep) })
-  ddDPD <- array(sapply(1:R, function(r1) sapply(1:R, function(r2) {
-    ee1 <- ee2 <- rep(0, R); ee1[r1] <- ep; ee2[r2] <- ep
-    (dpd_function(est + ee1 + ee2, D, alpha) + dpd_function(est - ee1 - ee2, D, alpha) - dpd_function(est + ee1 - ee2, D, alpha) - dpd_function(est - ee1 + ee2, D, alpha)) / (4 * ep^2)
-  })), dim = c(n, R, R))
-  I_mat <- t(dDPD) %*% dDPD / n
-  J_mat <- apply(ddDPD, c(2, 3), mean)
-  opt_w <- sum(diag(J_mat %*% solve(I_mat) %*% J_mat)) / sum(diag(J_mat))
-  
-  theta_mh_samples <- matrix(0, num_sim_llb, 2)
+  # --- 2-b. Metropolis-Hastings (Standard Bayes) ---
+  thin <- 50
+  num_total_mh <- num_sim * thin
+  theta_mh_samples <- matrix(0, nrow = num_sim, ncol = 2)
+  colnames(theta_mh_samples) <- c("mu", "sigma") # Name columns for clarity
   theta_current <- theta_init
-  step_size_mh <- 1 / 20
+  
+  # Standard deviation for the proposal distribution (may need tuning)
+  step_size_mh <- c(1/20, 1/20) 
+  
+  current_log_post <- log_posterior_standard(theta_current, D)
+  
   for (s in 1:num_total_mh) {
-    theta_proposal <- theta_current + rnorm(2, 0, step_size_mh)
+    # Propose new parameters
+    theta_proposal <- theta_current + rnorm(2, mean = 0, sd = step_size_mh)
+    
+    # Check if proposal is in the valid parameter space (sigma > 0)
     if (theta_proposal[2] > 0) {
-      log_ratio <- log_posterior(theta_proposal, D, opt_w, alpha) - log_posterior(theta_current, D, opt_w, alpha)
-      if (log_ratio > log(dqrunif(1))) theta_current <- theta_proposal
+      proposal_log_post <- log_posterior_standard(theta_proposal, D)
+      
+      # Calculate acceptance ratio
+      log_ratio <- proposal_log_post - current_log_post
+      
+      if (log(dqrunif(1)) < log_ratio) {
+        theta_current <- theta_proposal
+        current_log_post <- proposal_log_post
+      }
     }
-    if (s %% thin == 0) theta_mh_samples[s / thin, ] <- theta_current
+    # If theta_proposal[2] <= 0, the proposal is automatically rejected
+    
+    # Store the sample after thinning
+    if (s %% thin == 0) {
+      theta_mh_samples[s / thin, ] <- theta_current
+    }
   }
   
-  # --- 2-c. HMC (CmdStan-based MCMC) ---
-  D_stan <- list(
-    N = length(data_list$x_all),
-    x = data_list$x_all,
-    theta0 = theta_init,
-    beta = alpha,
-    w = opt_w
+  # --- 3. Calculate ESS for the MH samples ---
+  ess_results <- c(
+    mu_ess = mcmcse::ess(theta_mh_samples[, "mu"]),
+    sigma_ess = mcmcse::ess(theta_mh_samples[, "sigma"])
   )
-  stan_fit <- stan_model$sample(data = D_stan, iter_sampling = num_sim_llb, chains = 1, refresh = 0, show_messages = FALSE)
-  theta_cmdstan <- as_draws_matrix(stan_fit$draws(variables = c("mu", "sigma")))
   
-  # --- 3. Combine and Return Results for this Repetition ---
-  data.frame(
+  # --- 4. Combine and Return Results for this Repetition ---
+  # Combine samples into a data.frame
+  samples_df <- data.frame(
     repetition = rep,
-    method = rep(c("LLB with SGD", "MH", "HMC"), each = num_sim_llb),
-    mu = c(theta_estimates_llb[, 1], theta_mh_samples[, 1], theta_cmdstan[, 1]),
-    sigma = c(theta_estimates_llb[, 2], theta_mh_samples[, 2], theta_cmdstan[, 2])
+    method = rep(c("DPD LLB Posterior", "Standard Bayes (MH)"), each = num_sim),
+    mu = c(theta_estimates_llb[, 1], theta_mh_samples[, "mu"]),
+    sigma = c(theta_estimates_llb[, 2], theta_mh_samples[, "sigma"])
   )
+  
+  # Return both samples and ESS as a list
+  return(list(samples = samples_df, ess = ess_results))
 }
 stopCluster(cl)
 
 #################################################################
-##  Calculate and Display Averages of Posterior Statistics
+##           Process and Summarize Simulation Results
 #################################################################
 
-# 1. 
-all_summary_stats <- all_results %>%
+# Extract samples and ESS results from the loop output
+all_results_df <- dplyr::bind_rows(lapply(loop_results, function(x) x$samples))
+all_ess_df <- dplyr::bind_rows(lapply(loop_results, function(x) as.data.frame(t(x$ess))))
+
+# --- Display Average ESS ---
+avg_ess <- colMeans(all_ess_df, na.rm = TRUE)
+cat("\n--- Average Effective Sample Size (ESS) for MH method across", N_repetitions, "Repetitions ---\n")
+print(avg_ess)
+
+# --- Calculate and Display Averages of Posterior Statistics ---
+all_summary_stats <- all_results_df %>%
   group_by(repetition, method) %>%
   summarise(
     posterior_mean_mu = mean(mu, na.rm = TRUE),
@@ -195,7 +201,6 @@ all_summary_stats <- all_results %>%
     .groups = 'drop'
   )
 
-# 2. 
 final_summary <- all_summary_stats %>%
   group_by(method) %>%
   summarise(
@@ -206,28 +211,32 @@ final_summary <- all_summary_stats %>%
     .groups = 'drop'
   )
 
-# results
 cat("\n--- Average of Posterior Statistics across", N_repetitions, "Repetitions ---\n")
 print(final_summary)
 
+
 ##############################################
-##  Prepare Data for Plotting
+##      Prepare Data for Plotting
 ##############################################
-plot_data <- all_results %>%
+
+plot_data <- all_results_df %>%
   pivot_longer(cols = c("mu", "sigma"), names_to = "parameter", values_to = "value")
 plot_data$parameter <- factor(plot_data$parameter, levels = c("mu", "sigma"))
 
 ##################################################
 ##  Visualize Posterior Distributions with KDE
 ##################################################
+
 kde_plot <- ggplot(plot_data, aes(x = value, color = method)) +
   geom_density(aes(group = interaction(method, repetition)), alpha = 0.2, trim = TRUE) +
   facet_wrap(~ parameter, scales = "free", labeller = label_parsed) +
   labs(
-    title = element_blank(),
-    x = "Parameter Value", y = "Density", color = "Method"
+    title = "Comparison of Posterior Distributions",
+    x = "Parameter Value",
+    y = "Density",
+    color = "Method"
   ) +
-  scale_color_brewer(palette = "Set1") + # Use a color-blind friendly palette
+  scale_color_brewer(palette = "Set1") +
   theme_classic(base_size = 14) +
   theme(
     legend.position = "top",
@@ -236,3 +245,4 @@ kde_plot <- ggplot(plot_data, aes(x = value, color = method)) +
   )
 
 print(kde_plot)
+tictoc::toc()

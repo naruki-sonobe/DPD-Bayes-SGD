@@ -70,8 +70,6 @@ runParallelOptimization <- function(algorithmType) {
       
       # Optimization loop
       while (iter < maxIterations) {
-        prevTheta <- currentTheta
-        
         if (algorithmType == "SGD") {
           # Generate a batch of auxiliary samples for SGD
           Y <- generateY(currentTheta, m = batchSize)
@@ -102,9 +100,6 @@ runParallelOptimization <- function(algorithmType) {
             colMeans((2 * gridBound)^p * centeredY * densityY^(beta + 1))
           currentTheta <- currentTheta - stepSize * gradient
         }
-        
-        # Check convergence
-        if (max(abs(currentTheta - prevTheta)) < 1e-3) break
         iter <- iter + 1
       }
       t(currentTheta)
@@ -122,7 +117,7 @@ runParallelOptimization <- function(algorithmType) {
 
 # Set sample size and contamination rate
 n <- 100
-dimensions <- c(1, 3, 5, 7)
+dimensions <- c(2, 3)
 contaminationRate <- 0.05
 
 # Matrices to store execution times and mean squared errors

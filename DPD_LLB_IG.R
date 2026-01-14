@@ -111,7 +111,6 @@ theta_estimates_proposed <- foreach(s = 1:num_sim, .combine = rbind, .packages =
     
     theta_current <- theta_current - step_size * stoc_grad
     
-    if (max(abs(theta_current - prev_theta))^2 < 1e-8) break
     iter_count <- iter_count + 1
   }
   theta_current
@@ -137,8 +136,8 @@ dens_plot <- ggplot(observed_data_df, aes(x = x)) +
                  fill = "lightblue", color = "black", alpha = 0.5) +
   geom_line(data = density_df, aes(x = x, y = density), 
             color = "magenta", linewidth = 1.2) +
-  labs(title = "Histogram and Estimated Inverse Gaussian Density",
+  labs(title = element_blank(),
        x = "x", y = "Density") +
-  theme_minimal()
+  theme_classic(base_size = 14)
 
 print(dens_plot)

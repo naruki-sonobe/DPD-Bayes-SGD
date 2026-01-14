@@ -1,44 +1,41 @@
 #######################################
-##    Load Necessary Libraries
+##   Load Necessary Libraries
 #######################################
 # install.packages("doParallel")
 # install.packages("foreach")
 # install.packages("ggplot2")
 # install.packages("tictoc")
 # install.packages("dqrng")
+# install.packages("tidyr")
+# install.packages("dplyr") # For data summarization
 
 library(doParallel)  # For parallel computing
 library(foreach)     # For 'foreach' loops
 library(ggplot2)     # For plotting
 library(tictoc)      # For timing
 library(dqrng)       # For generating random numbers (dqrexp, dqrnorm)
+library(tidyr)       # For data manipulation (pivot_longer)
+library(dplyr)       # For data summarization
 
 # Clear the workspace
 rm(list = ls())
 
 #######################################
-##        Helper Functions
+##         Helper Functions
 #######################################
 
 # Function to generate data with contamination
 generate_data <- function(n = 100, contamination_rate = 0.01) {
-  n_main <- ceiling(n * (1 - contamination_rate))  # Number of samples from the main distribution
-  n_outliers <- n - n_main                         # Number of contaminated (outlier) samples
+  n_main <- ceiling(n * (1 - contamination_rate))
+  n_outliers <- n - n_main
   
   x_main <- dqrnorm(n = n_main, mean = 0, sd = 1)
   x_outliers <- dqrnorm(n = n_outliers, mean = 10, sd = 0.1)
   
-  return(list(
-    n_main = n_main,
-    n_outliers = n_outliers,
-    x_main = x_main,
-    x_outliers = x_outliers,
-    x_all = c(x_main, x_outliers),
-    contamination_rate = contamination_rate
-  ))
+  return(c(x_main, x_outliers))
 }
 
-# Calculate the density of N(mu, sigma^2) for a given theta = (mu, sigma)
+# Calculate the density of N(mu, sigma^2)
 calc_density <- function(theta, x) {
   mu <- theta[1]
   sigma <- theta[2]
@@ -72,204 +69,171 @@ generate_y <- function(theta, m = 10) {
 }
 
 #######################################
-##        Main Part
+##       Simulation Parameters
 #######################################
 
-# Sample size
+# General parameters
 sample_size <- 1000
-# Contamination rate
 contamination_rate <- 0.05
-
-# Generate data
-data_list <- generate_data(n = sample_size, contamination_rate = contamination_rate)
-observed_data <- data_list$x_all  # Observed data vector
-
-# Iteration parameters
 max_iter <- 500
+beta_param <- 0.5
+num_draws_y <- 10
+num_sim <- 10000 # Posterior samples per repetition
+
+# Number of repetitions for the entire simulation
+N_repetitions <- 20
 
 # Learning rate parameters
-step_size_init <- 1
+step_size_init <- 0.1
 step_decay_rate <- 0.7
 step_decay_interval <- 25
 
-# Initial parameter values
-theta_init <- c(median(observed_data), mad(observed_data))
-
-# Other parameters
-beta_param <- 0.5
-num_draws_y <- 100    # Number of Y samples per iteration
-num_sim <- 10000      # Number of repetitions for parallel simulation
-
 ##################################################
-##  1. Proposed Method (LLB + Monte Carlo approximation)
+##  Main Simulation Loop
+##  (Run the entire experiment N_repetitions times)
 ##################################################
 
-# Start parallel processing
+# Start parallel processing for the outer loop
 cores <- getOption("mc.cores", detectCores())
 cl <- makeCluster(cores)
 registerDoParallel(cl)
 
-tictoc::tic("Proposed Method & Exact LLB - Total Time")
+tictoc::tic("Total Simulation Time")
 
-theta_estimates_proposed <- foreach(s = 1:num_sim, 
-                                    .combine = rbind, 
-                                    .packages = "dqrng") %dopar% {
-                                      # Initialize parameters
-                                      theta_current <- theta_init
-                                      step_size <- step_size_init
-                                      
-                                      # Generate weighted exponential samples
-                                      u <- dqrexp(length(observed_data), 1)
-                                      weights <- length(observed_data) * u / sum(u)
-                                      
-                                      iter_count <- 0
-                                      while (iter_count < max_iter) {
-                                        # Generate Y samples
-                                        y_sample <- generate_y(theta_current, m = num_draws_y)
-                                        
-                                        # Calculate density and score for both X and Y
-                                        dens_x <- calc_density(theta_current, observed_data)
-                                        score_x <- calc_score(theta_current, observed_data)
-                                        
-                                        dens_y <- calc_density(theta_current, y_sample)
-                                        score_y <- calc_score(theta_current, y_sample)
-                                        
-                                        # Calculate stochastic gradient
-                                        stoc_grad <- -colMeans(weights * dens_x^beta_param * score_x) +
-                                          colMeans(dens_y^beta_param * score_y)
-                                        
-                                        # Update step size
-                                        if (iter_count %% step_decay_interval == 0) {
-                                          step_size <- step_size * step_decay_rate
-                                        }
-                                        
-                                        # Update parameters
-                                        theta_current <- theta_current - step_size * stoc_grad
-                                        iter_count <- iter_count + 1
-                                      }
-                                      # Return parameter estimates (combined with rbind)
-                                      theta_current
-                                    }
+# Use foreach to parallelize the N_repetitions
+all_results <- foreach(
+  rep = 1:N_repetitions, 
+  .combine = rbind, 
+  .packages = c("dqrng", "doParallel")
+) %dopar% {
+  
+  # 1. Generate a new dataset for this repetition
+  observed_data <- generate_data(n = sample_size, contamination_rate = contamination_rate)
+  theta_init <- c(median(observed_data), mad(observed_data))
+  
+  # --- Proposed Method ---
+  theta_estimates_proposed <- foreach(s = 1:num_sim, .combine = rbind) %do% {
+    theta_current <- theta_init
+    step_size <- step_size_init
+    u <- dqrexp(length(observed_data), 1)
+    weights <- length(observed_data) * u / sum(u)
+    
+    for (iter_count in 1:max_iter) {
+      y_sample <- generate_y(theta_current, m = num_draws_y)
+      dens_x <- calc_density(theta_current, observed_data)
+      score_x <- calc_score(theta_current, observed_data)
+      dens_y <- calc_density(theta_current, y_sample)
+      score_y <- calc_score(theta_current, y_sample)
+      stoc_grad <- -colMeans(weights * dens_x^beta_param * score_x) + colMeans(dens_y^beta_param * score_y)
+      if (iter_count %% step_decay_interval == 0) step_size <- step_size * step_decay_rate
+      theta_current <- theta_current - step_size * stoc_grad
+    }
+    theta_current
+  }
+  
+  # --- Exact LLB Method ---
+  theta_estimates_llb <- foreach(s = 1:num_sim, .combine = rbind) %do% {
+    theta_current <- theta_init
+    step_size <- step_size_init
+    u <- dqrexp(length(observed_data), 1)
+    weights <- length(observed_data) * u / sum(u)
+    
+    for (iter_count in 1:max_iter) {
+      dens_x <- calc_density(theta_current, observed_data)
+      score_x <- calc_score(theta_current, observed_data)
+      grad_exact <- -colMeans(weights * dens_x^beta_param * score_x) + calc_regularizer(theta_current, beta_param)
+      if (iter_count %% step_decay_interval == 0) step_size <- step_size * step_decay_rate
+      theta_current <- theta_current - step_size * grad_exact
+    }
+    theta_current
+  }
+  
+  # 2. Combine results into a data frame for this repetition
+  data.frame(
+    repetition = rep,
+    method = rep(c("LLB with SGD", "LLB"), each = num_sim),
+    mu = c(theta_estimates_proposed[, 1], theta_estimates_llb[, 1]),
+    sigma = c(theta_estimates_proposed[, 2], theta_estimates_llb[, 2])
+  )
+}
 
 stopCluster(cl)
+tictoc::toc()
 
-##################################################
-##  2. Exact LLB
-##################################################
+#################################################################
+##  Calculate and Display Averages of Posterior Statistics
+#################################################################
 
-# Start parallel processing
-cores <- getOption("mc.cores", detectCores())
-cl <- makeCluster(cores)
-registerDoParallel(cl)
-
-theta_estimates_llb <- foreach(s = 1:num_sim, 
-                               .combine = rbind, 
-                               .packages = "dqrng") %dopar% {
-                                 theta_current <- theta_init
-                                 step_size <- step_size_init
-                                 
-                                 # Generate weighted exponential samples
-                                 u <- dqrexp(length(observed_data), 1)
-                                 weights <- length(observed_data) * u / sum(u)
-                                 
-                                 iter_count <- 0
-                                 while (iter_count < max_iter) {
-                                   dens_x <- calc_density(theta_current, observed_data)
-                                   score_x <- calc_score(theta_current, observed_data)
-                                   
-                                   # Calculate gradient with regularization for Exact LLB
-                                   grad_exact <- -colMeans(weights * dens_x^beta_param * score_x) + 
-                                     calc_regularizer(theta_current, beta_param)
-                                   
-                                   # Update step size
-                                   if (iter_count %% step_decay_interval == 0) {
-                                     step_size <- step_size * step_decay_rate
-                                   }
-                                   
-                                   # Update parameters
-                                   theta_current <- theta_current - step_size * grad_exact
-                                   iter_count <- iter_count + 1
-                                 }
-                                 theta_current
-                               }
-
-stopCluster(cl)
-
-tictoc::toc()  # End timing
-
-##############################################
-##  Collect and summarize results
-##############################################
-
-# For Proposed method
-means_proposed <- colMeans(theta_estimates_proposed)
-vars_proposed  <- apply(theta_estimates_proposed, 2, var)
-
-# For Exact LLB
-means_llb <- colMeans(theta_estimates_llb)
-vars_llb  <- apply(theta_estimates_llb, 2, var)
-
-# Display results
-cat("\nPosterior Means:\n")
-cat("Proposed - mu:", means_proposed[1], "sigma:", means_proposed[2], "\n")
-cat("LLB      - mu:", means_llb[1], "sigma:", means_llb[2], "\n")
-
-cat("\nPosterior Variances:\n")
-cat("Proposed - mu:", vars_proposed[1], "sigma:", vars_proposed[2], "\n")
-cat("LLB      - mu:", vars_llb[1], "sigma:", vars_llb[2], "\n\n")
-
-##############################
-##  Visualize Posterior Distributions
-##############################
-
-hist_location <- ggplot() +
-  stat_bin(mapping = aes(x = theta_estimates_proposed[,1], fill = "Proposed", alpha = 0.5), binwidth = 0.02) +
-  stat_bin(mapping = aes(x = theta_estimates_llb[,1], fill = "LLB", alpha = 0.5), binwidth = 0.02) +
-  labs(x = expression(mu), y = "Frequency", fill = "Method") +
-  guides(alpha = "none") +
-  theme_classic(base_size = 14) +
-  theme(
-    aspect.ratio = 0.6,
-    legend.position = c(0.8, 0.85),
-    legend.justification = c(0, 1),
-    legend.margin = margin(2, 2, 2, 2),
-    legend.key.size = unit(1, "lines"),
-    legend.text = element_text(size = 12),
-    axis.title = element_text(size = 14),
-    axis.text = element_text(size = 12),
-    plot.margin = unit(c(0.3, 0.3, 0.3, 0.3), "lines")
-  ) +
-  coord_cartesian(
-    xlim = c(
-      min(c(theta_estimates_proposed[,1], theta_estimates_llb[,1])),
-      max(c(theta_estimates_proposed[,1], theta_estimates_llb[,1]))
-    )
+all_summary_stats <- all_results %>%
+  group_by(repetition, method) %>%
+  summarise(
+    posterior_mean_mu = mean(mu, na.rm = TRUE),
+    posterior_var_mu = var(mu, na.rm = TRUE),
+    posterior_mean_sigma = mean(sigma, na.rm = TRUE),
+    posterior_var_sigma = var(sigma, na.rm = TRUE),
+    .groups = 'drop'
   )
 
-hist_scale <- ggplot() +
-  stat_bin(mapping = aes(x = theta_estimates_proposed[,2], fill = "Proposed", alpha = 0.5), binwidth = 0.02) +
-  stat_bin(mapping = aes(x = theta_estimates_llb[,2], fill = "LLB", alpha = 0.5), binwidth = 0.02) +
-  labs(x = expression(sigma), y = "Frequency", fill = "Method") +
-  guides(alpha = "none") +
-  theme_classic(base_size = 14) +
-  theme(
-    aspect.ratio = 0.6,
-    legend.position = c(0.8, 0.85),
-    legend.justification = c(0, 1),
-    legend.margin = margin(2, 2, 2, 2),
-    legend.key.size = unit(1, "lines"),
-    legend.text = element_text(size = 12),
-    axis.title = element_text(size = 14),
-    axis.text = element_text(size = 12),
-    plot.margin = unit(c(0.3, 0.3, 0.3, 0.3), "lines")
-  ) +
-  coord_cartesian(
-    xlim = c(
-      min(c(theta_estimates_proposed[,2], theta_estimates_llb[,2])),
-      max(c(theta_estimates_proposed[,2], theta_estimates_llb[,2]))
-    )
+final_summary <- all_summary_stats %>%
+  group_by(method) %>%
+  summarise(
+    avg_posterior_mean_mu = mean(posterior_mean_mu, na.rm = TRUE),
+    avg_posterior_var_mu = mean(posterior_var_mu, na.rm = TRUE),
+    avg_posterior_mean_sigma = mean(posterior_mean_sigma, na.rm = TRUE),
+    avg_posterior_var_sigma = mean(posterior_var_sigma, na.rm = TRUE),
+    .groups = 'drop'
   )
 
-# Display histograms
-print(hist_location)
-print(hist_scale)
+cat("\n--- Average of Posterior Statistics across", N_repetitions, "Repetitions ---\n")
+print(final_summary)
+
+
+##############################################
+##  Prepare Data for Plotting
+##############################################
+
+# Convert the results from wide to long format for easier plotting with ggplot2
+plot_data <- all_results %>%
+  pivot_longer(
+    cols = c("mu", "sigma"),
+    names_to = "parameter",
+    values_to = "value"
+  )
+
+# Ensure 'parameter' is a factor to control facet order
+plot_data$parameter <- factor(plot_data$parameter, levels = c("mu", "sigma"))
+
+##################################################
+##  Visualize Posterior Distributions with KDE
+##################################################
+
+kde_plot <- ggplot(plot_data, aes(x = value, color = method)) +
+  # Add the geom_density layer. 
+  # The 'group' aesthetic is crucial: it tells ggplot to draw a separate line
+  # for each combination of method and repetition.
+  # 'alpha' is set to a low value to make the lines transparent, showing overlap.
+  geom_density(aes(group = interaction(method, repetition)), alpha = 0.2, trim = TRUE) +
+  
+  # Use facet_wrap to create separate panels for mu and sigma.
+  # 'scales = "free"' allows the x and y axes to adapt to the data in each panel.
+  # 'labeller' is used to parse Greek letters for facet titles.
+  facet_wrap(~ parameter, scales = "free", labeller = label_parsed) +
+  
+  # Add labels and a title
+  labs(
+    title = element_blank(),
+    x = "Parameter Value",
+    y = "Density",
+    color = "Method" 
+  ) +
+  
+  # Apply a clean theme
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "top",
+    strip.background = element_rect(fill = "gray90", color = "gray90"),
+    strip.text = element_text(face = "bold", size = 12)
+  )
+
+# Display the plot
+print(kde_plot)

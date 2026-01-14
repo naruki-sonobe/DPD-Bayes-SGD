@@ -130,7 +130,6 @@ THETA <- foreach(s = 1:num_sim, .packages = "VGAM", .combine = "rbind") %dopar% 
     # Update in log-scale (hence the multiplication by exp(theta))
     theta <- theta - step_size * stoc_grad * exp(theta)
     
-    if (max(abs(theta - prev_theta))^2 < 1e-8) break
     iter_count <- iter_count + 1
   }
   # Return the estimated parameters in the original scale
@@ -154,9 +153,9 @@ dens_plot <- ggplot(observed_data_df, aes(x = x)) +
   geom_histogram(aes(y = ..density..), bins = 30,
                  fill = "lightblue", color = "black", alpha = 0.6) +
   geom_line(data = density_df, aes(x = x, y = density),
-            color = "magenta", size = 1.5) +
-  labs(title = "Histogram and Estimated Gompertz Density",
+            color = "magenta", linewidth = 1.5) +
+  labs(title = element_blank(),
        x = "x", y = "Density") +
-  theme_minimal()
+  theme_classic(base_size = 14)
 
 print(dens_plot)

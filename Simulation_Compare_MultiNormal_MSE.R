@@ -70,8 +70,6 @@ runParallelOptimization <- function(algorithmType) {
                           
                           # Optimization loop
                           while (iter < maxIterations) {
-                            previousTheta <- currentTheta
-                            
                             if (algorithmType == "SGD") {
                               # Generate a batch of auxiliary samples for SGD
                               auxiliarySamples <- generateAuxiliarySamples(currentTheta, m = batchSize)
@@ -122,7 +120,10 @@ n <- 100
 dimensions <- c(2, 3)
 contaminationRate <- 0.05
 numSimulations <- 1000  # Number of simulation repetitions
+
+# Initialize matrices to store results
 mseResults <- matrix(0, nrow = length(dimensions), ncol = 2)
+varianceResults <- matrix(0, nrow = length(dimensions), ncol = 2) #<-- ADDED: Matrix for variance
 
 # Loop over each sample dimension
 for (i in seq_along(dimensions)) {
@@ -134,8 +135,8 @@ for (i in seq_along(dimensions)) {
     dataMatrix <- dataSet$dataMatrix
     
     # Set parameters for parallel replicates and optimization iterations
-    numReplicates <- 1000   # Number of replicates for the parallel optimization
-    maxIterations <- 500     # Maximum number of iterations per replicate
+    numReplicates <- 1000     # Number of replicates for the parallel optimization
+    maxIterations <- 500      # Maximum number of iterations per replicate
     initialTheta <- apply(dataMatrix, 2, median)
     
     # Parameters for SGD
@@ -155,17 +156,31 @@ for (i in seq_along(dimensions)) {
     thetaResult_SGD <- runParallelOptimization("SGD")
     sgdTime <- toc(quiet = TRUE)$callback_msg  # (Optional) time message
     mseResults[i, 1] <- mseResults[i, 1] + mean(colMeans(thetaResult_SGD)^2)
+    # ADDED: Calculate and store the average variance for SGD parameters
+    varianceResults[i, 1] <- varianceResults[i, 1] + mean(apply(thetaResult_SGD, 2, var))
     
     # Run FBGD optimization and time it
     tic("FBGD")
     thetaResult_FBGD <- runParallelOptimization("FBGD")
     fbgdTime <- toc(quiet = TRUE)$callback_msg  # (Optional) time message
     mseResults[i, 2] <- mseResults[i, 2] + mean(colMeans(thetaResult_FBGD)^2)
+    # ADDED: Calculate and store the average variance for FBGD parameters
+    varianceResults[i, 2] <- varianceResults[i, 2] + mean(apply(thetaResult_FBGD, 2, var))
   }
-  # Average the MSE over the number of simulations
+  # Average the results over the number of simulations
   mseResults[i, ] <- mseResults[i, ] / numSimulations
+  varianceResults[i, ] <- varianceResults[i, ] / numSimulations 
 }
 
-# (Optional) Print final Mean Squared Error (MSE) results for each algorithm and dimension
-print("Mean Squared Errors (MSE) for each algorithm and dimension:")
+# Set column names for clarity in the output
+colnames(mseResults) <- c("SGD", "FBGD")
+colnames(varianceResults) <- c("SGD", "FBGD")
+rownames(mseResults) <- paste("Dim=", dimensions)
+rownames(varianceResults) <- paste("Dim=", dimensions)
+
+# Print final results
+print("Mean Squared Errors (MSE):")
 print(mseResults)
+
+print("Average Posterior Variances:")
+print(varianceResults)
