@@ -89,7 +89,7 @@ N_repetitions <- 20
 ##################################################
 ##  Compile Stan Model from External File
 ##################################################
-stan_model_file <- "~/Documents/Research(Master)/General_Bayes_DPD/Research paper/Simulation/Simulation1/DPD_GB_Normal.stan"
+stan_model_file <- "DPD_GB_Normal.stan"
 stan_model <- cmdstan_model(stan_model_file)
 
 ##################################################
